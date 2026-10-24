@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Story Quest</title>
+  <style>
+    body { font: 18px/1.5 system-ui, sans-serif; max-width: 680px; margin: 8vh auto; padding: 24px; color: #203b32; background: #f5f4ed; }
+    h1 { margin-bottom: 0; }
+    button { font: inherit; padding: 10px 24px; cursor: pointer; }
+    #status { font-size: 2rem; font-weight: 700; margin: 24px 0; }
+    dt { font-weight: 600; margin-top: 24px; }
+    dd { margin: 8px 0; min-height: 1.5em; overflow-wrap: anywhere; }
+    #error { color: #9d2727; overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <h1>Story Quest</h1>
+  <p>Say something, pause, and hear Fox say it back. A headset helps.</p>
+  <button id="start" type="button">Start</button>
+  <div id="status" role="status" aria-live="polite">Ready</div>
+  <dl>
+    <dt>Live transcript</dt><dd id="transcript"></dd>
+    <dt>Last turn</dt><dd id="last-turn"></dd>
+  </dl>
+  <p id="error" role="alert"></p>
+  <script>
+    const startButton = document.querySelector('#start');
+    const statusLine = document.querySelector('#status');
+    const transcript = document.querySelector('#transcript');
+    const lastTurn = document.querySelector('#last-turn');
+    const errorLine = document.querySelector('#error');
+    let activeSession = null;
+
+    // MIC CAPTURE: self-contained worklet, fractional box-filter resampling.
+    // sampleRate is the worklet's actual device/context rate (44.1k, 48k, etc.).
+    const micWorklet = `
+      class MicPCM extends AudioWorkletProcessor {
+        constructor() {
+          super();
+          this.ratio = sampleRate / 16000;
+          this.remaining = this.ratio;
+          this.sum = 0;
+          this.frame = new ArrayBuffer(3200);
+          this.view = new DataView(this.frame);
+          this.count = 0;
+        }
+        process(inputs) {
+          const channel = inputs[0]?.[0];
+          if (!channel) return true;
+          for (const sample of channel) {
+            let available = 1;
+            while (available > 1e-10) {
+              const weight = Math.min(available, this.remaining);
+              this.sum += sample * weight;
+              this.remaining -= weight;
+              available -= weight;
+              if (this.remaining < 1e-10) {
+                const value = Math.max(-1, Math.min(1, this.sum / this.ratio));
+                const pcm = Math.round(value * (value < 0 ? 32768 : 32767));
+                this.view.setInt16(this.count * 2, pcm, true);
+                this.count += 1;
+                if (this.count === 1600) {
+                  this.port.postMessage(this.frame, [this.frame]);
+                  this.frame = new ArrayBuffer(3200);
+                  this.view = new DataView(this.frame);
+                  this.count = 0;
+                }
+                this.sum = 0;
+                this.remaining = this.ratio;
+              }
+            }
+          }
+          return true;
+        }
+      }
+      registerProcessor('mic-pcm', MicPCM);
+    `;
+
+    async function startMicCapture(session) {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+      });
+      if (session.closed) {
+        stream.getTracks().forEach(track => track.stop());
+        return;
+      }
+      session.stream = stream;
+      const url = URL.createObjectURL(new Blob([micWorklet], { type: 'text/javascript' }));
+      try {
+        await session.context.audioWorklet.addModule(url);
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+      if (session.closed) return;
+      session.micSource = session.context.createMediaStreamSource(stream);
+      session.worklet = new AudioWorkletNode(session.context, 'mic-pcm', {
+        channelCount: 1, channelCountMode: 'explicit',
+      });
+      session.worklet.port.onmessage = event => {
+        if (session.socket.readyState === WebSocket.OPEN) {
+          session.socket.send(event.data);
+        }
+      };
+      // The processor emits silence at its output; connecting it keeps it alive
+      // without feeding the microphone back into the speakers.
+      session.micSource.connect(session.worklet);
+      session.worklet.connect(session.context.destination);
+    }
+
+    function stopMicCapture(session) {
+      session.stream?.getTracks().forEach(track => track.stop());
+      session.micSource?.disconnect();
+      session.worklet?.disconnect();
+      if (session.worklet) session.worklet.port.onmessage = null;
+    }
+
+    // PLAYBACK: 24 kHz PCM is scheduled on the device-rate AudioContext.
+    // Web Audio handles playback resampling; keep its cursor across chunks.
+    function beginPlayback(session) {
+      session.playback = {
+        nextStartTime: session.context.currentTime,
+        sources: new Set(), ended: false, acknowledged: false,
+      };
+    }
+
+    function queuePlayback(session, bytes) {
+      const playback = session.playback;
+      if (!playback || bytes.byteLength === 0) return;
+      if (bytes.byteLength % 2) throw new Error('Invalid 16-bit reply audio');
+      const pcm = new DataView(bytes);
+      const buffer = session.context.createBuffer(1, bytes.byteLength / 2, 24000);
+      const samples = buffer.getChannelData(0);
+      for (let i = 0; i < samples.length; i++) {
+        samples[i] = pcm.getInt16(i * 2, true) / 32768;
+      }
+      const source = session.context.createBufferSource();
+      source.buffer = buffer;
+      source.connect(session.context.destination);
+      playback.sources.add(source);
+      source.onended = () => {
+        source.disconnect();
+        playback.sources.delete(source);
+        acknowledgePlayback(session, playback);
+      };
+      const startAt = Math.max(session.context.currentTime, playback.nextStartTime);
+      source.start(startAt);
+      playback.nextStartTime = startAt + buffer.duration;
+    }
+
+    function endPlayback(session) {
+      if (!session.playback) beginPlayback(session);
+      session.playback.ended = true;
+      acknowledgePlayback(session, session.playback);
+    }
+
+    function acknowledgePlayback(session, playback) {
+      if (session.closed || playback !== session.playback || !playback.ended ||
+          playback.sources.size || playback.acknowledged) return;
+      playback.acknowledged = true;
+      if (session.socket.readyState === WebSocket.OPEN) {
+        session.socket.send(JSON.stringify({ type: 'playback_done' }));
+        statusLine.textContent = 'Listening';
+      }
+    }
+
+    function stopPlayback(session) {
+      for (const source of session.playback?.sources ?? []) {
+        source.onended = null;
+        source.stop();
+        source.disconnect();
+      }
+      session.playback = null;
+    }
+
+    // SESSION / UI: transport glue, deliberately separate from audio functions.
+    async function stopSession(session) {
+      if (session.closed) return;
+      session.closed = true;
+      stopMicCapture(session);
+      stopPlayback(session);
+      session.socket?.close();
+      if (session.context.state !== 'closed') await session.context.close();
+      if (activeSession === session) {
+        activeSession = null;
+        startButton.disabled = false;
+        statusLine.textContent = 'Disconnected';
+      }
+    }
+
+    function receiveMessage(session, event) {
+      if (session.closed) return;
+      if (event.data instanceof ArrayBuffer) {
+        queuePlayback(session, event.data);
+        return;
+      }
+      const message = JSON.parse(event.data);
+      switch (message.type) {
+        case 'transcript': transcript.textContent = message.text; break;
+        case 'turn_end':
+          lastTurn.textContent = message.text;
+          transcript.textContent = '';
+          statusLine.textContent = 'Speaking';
+          break;
+        case 'speaking_start':
+          beginPlayback(session);
+          statusLine.textContent = 'Speaking';
+          break;
+        case 'speaking_end': endPlayback(session); break;
+        case 'error': errorLine.textContent = message.message; break;
+      }
+    }
+
+    startButton.addEventListener('click', async () => {
+      startButton.disabled = true;
+      errorLine.textContent = '';
+      statusLine.textContent = 'Connecting';
+      let session;
+      try {
+        // Create AND resume inside the Start gesture, before any mic prompt.
+        session = { context: new AudioContext(), closed: false };
+        activeSession = session;
+        await session.context.resume();
+        const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        session.socket = new WebSocket(protocol + '//' + location.host + '/ws');
+        session.socket.binaryType = 'arraybuffer';
+        session.socket.onmessage = event => {
+          try { receiveMessage(session, event); }
+          catch (error) {
+            errorLine.textContent = error.message;
+            void stopSession(session);
+          }
+        };
+        session.socket.onclose = () => { void stopSession(session); };
+        await new Promise((resolve, reject) => {
+          session.socket.onopen = resolve;
+          session.socket.onerror = () => reject(new Error('Cannot connect to voice server'));
+          session.socket.addEventListener('close', () => reject(new Error('Voice connection closed')), { once: true });
+        });
+        await startMicCapture(session);
+        if (!session.closed) statusLine.textContent = 'Listening';
+      } catch (error) {
+        errorLine.textContent = error.message;
+        if (session) await stopSession(session);
+        else {
+          startButton.disabled = false;
+          statusLine.textContent = 'Disconnected';
+        }
+      }
+    });
+    window.addEventListener('pagehide', () => {
+      if (activeSession) void stopSession(activeSession);
+    });
+  </script>
+</body>
+</html>

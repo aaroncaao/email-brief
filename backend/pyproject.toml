@@ -1,0 +1,13 @@
+[project]
+name = "story-quest"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "cartesia[websockets]==4.2.0",
+    "python-dotenv",
+]
+
+[tool.uv]
+package = false
