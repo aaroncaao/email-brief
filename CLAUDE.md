@@ -162,15 +162,6 @@ Each turn, Claude returns **strict JSON** (parse defensively, fall back to a saf
 - Kids pause mid-sentence. Prefer **longer silence thresholds** over cutting them off. Never interrupt a child who is still thinking.
 - Pronunciation/expressive speaking activities are **optional/stretch**. Only attempt after the core loop is solid.
 
-## 11. Frontend Guidelines
-
-- Big, obvious mic state (idle / listening / thinking / speaking). Kids and judges both need clear feedback.
-- Highlight the active character's avatar while they speak; animate subtly.
-- Scene art: 4–6 **pre-made static images** swapped on `advance_scene`. No live image generation.
-- Show a simple live transcript of the child's words (judges can verify "Boat!" → full explanation).
-- Retell screen: big "Tell me the story!" prompt, then a short feedback card.
-- Accessibility: large tap targets, high contrast, no reliance on reading (kids may be early readers).
-
 ## 12. Retelling Activity
 
 After the final scene, the child retells the story. Backend sends the retell transcript + stored `child_ideas` and scene summaries to Claude, which returns:
